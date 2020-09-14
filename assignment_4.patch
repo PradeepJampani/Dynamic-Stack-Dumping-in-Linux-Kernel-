@@ -1,0 +1,180 @@
+diff -uNr kernel_original/arch/x86/syscalls/syscall_32.tbl kernel_p_old/arch/x86/syscalls/syscall_32.tbl
+--- kernel_original/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel_p_old/arch/x86/syscalls/syscall_32.tbl	2020-05-01 20:48:38.750068690 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359     i386    insdump            sys_dumpstack
++360     i386    rmdump            sys_dumpstack2
+diff -uNr kernel_original/dump_stack/dynamic_dump_stack.c kernel_p_old/dump_stack/dynamic_dump_stack.c
+--- kernel_original/dump_stack/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ kernel_p_old/dump_stack/dynamic_dump_stack.c	2020-05-01 20:41:35.696347000 -0700
+@@ -0,0 +1,148 @@
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/slab.h>
++#include <linux/kallsyms.h>
++#include <linux/kprobes.h>
++#include <linux/syscalls.h>
++#include <linux/sched.h>
++#define CONFIG_DYNAMIC_DUMP_STACK 1
++
++int **arr;
++int *p;
++
++/*configuring different dump modes*/
++typedef enum dump_modes
++{
++    PARENT_DUMP,
++    CHILD_DUMP,
++    GENERAL_DUMP
++}dump_mode_t;
++
++
++
++/*probe data structure*/
++struct probe_struct
++{
++    struct list_head next;
++    struct kprobe probe;
++    unsigned int id;
++};
++
++/* maintaing a list of registered probes*/
++static LIST_HEAD(list_probe_k);
++
++static unsigned int id_counter = 0;
++
++
++static DEFINE_MUTEX(probe_list_mutex);
++
++
++/*prehandler with dumpstack */
++int kprobe_pre_handler(struct kprobe *kp, struct pt_regs *regs)
++{
++    printk("Printing the dump stack\n");
++    dump_stack();
++    return 0;
++}
++/*pre handler without dumpstack*/
++
++int kprobe_pre_handler1(struct kprobe *kp, struct pt_regs *regs)
++{
++    printk(KERN_ERR "has no dump stack\n");
++    
++    return 0;
++}
++
++
++
++/*syscall to register probe and insert dumpstack at a location*/
++
++asmlinkage long sys_dumpstack(const char * symbolname,dump_mode_t mode)
++{
++    int id = 0;
++    unsigned long symbol_addr;
++    int rc = 0;
++    struct probe_struct *probe_l;
++
++	#ifndef CONFIG_DYNAMIC_DUMP_STACK
++    return -1;
++	#endif
++	
++    symbol_addr = kallsyms_lookup_name(symbolname);
++    if (!symbol_addr)
++        return -EINVAL;
++	 
++
++    probe_l = kmalloc(sizeof(struct probe_struct), GFP_KERNEL);
++    if (!probe_l)
++        return -EINVAL;
++
++    memset(&(probe_l->probe), 0, sizeof(struct kprobe));
++	
++
++//checking if the mode is 0 if the parent process is calling or if the mode is 1 if the subprocess sharing the parent id is calling 		the function or if any and then enabling dumpstack if condition is matched or not enabling the dumpstack
++   if((task_tgid_vnr(current)==task_pid_nr(current) && mode==0)||(task_tgid_vnr(current)!=task_pid_nr(current) && mode==1)||mode==2){
++    probe_l->probe.addr = (kprobe_opcode_t *)symbol_addr;
++    probe_l->probe.pre_handler = kprobe_pre_handler;
++    probe_l->probe.post_handler = NULL;
++    probe_l->probe.fault_handler = NULL;
++	}
++   else{
++	 probe_l->probe.addr = (kprobe_opcode_t *)symbol_addr;
++    probe_l->probe.pre_handler = kprobe_pre_handler1;
++    probe_l->probe.post_handler = NULL;
++    probe_l->probe.fault_handler = NULL;
++	}
++    rc = register_kprobe(&(probe_l->probe));
++    if (rc)
++    {
++        printk("Could not register probe at  %lx. rc = %d\n" ,symbol_addr, rc);
++        kfree(probe_l);
++        return EINVAL;
++    }
++
++   /*atomically kprobe to list of kprobes*/
++    mutex_lock(&probe_list_mutex);
++    probe_l->id = id_counter++;
++    list_add(&probe_l->next, &list_probe_k);
++    mutex_unlock(&probe_list_mutex);
++
++    printk("Added kprobe with id %d\n", probe_l->id);
++
++    id=probe_l->id;
++
++    return id;
++}
++
++/*syscall to remove dumpstack*/
++asmlinkage long sys_dumpstack2(int id)
++{
++
++	struct probe_struct *probe_l, *tmp;
++	#ifndef CONFIG_DYNAMIC_DUMP_STACK
++    return -1;
++	#endif
++
++	
++    if (list_empty(&list_probe_k))
++    {
++        printk("There are no probes\n");
++        return EINVAL;//returning einval if no proves are registered with given id
++    }
++
++	/*atomically removing the probes*/
++    mutex_lock(&probe_list_mutex);
++    list_for_each_entry_safe(probe_l, tmp, &list_probe_k, next)
++    {
++        if (probe_l->id == id)
++        {
++            unregister_kprobe(&probe_l->probe);
++            list_del(&probe_l->next);
++            kfree(probe_l);
++        }
++    }
++    mutex_unlock(&probe_list_mutex);
++    printk("Removed the %d probe\n", id);
++
++    return 0;
++}
+diff -uNr kernel_original/dump_stack/Makefile kernel_p_old/dump_stack/Makefile
+--- kernel_original/dump_stack/Makefile	1969-12-31 17:00:00.000000000 -0700
++++ kernel_p_old/dump_stack/Makefile	2020-05-01 20:22:10.746130000 -0700
+@@ -0,0 +1,3 @@
++ccflags-$(CONFIG_PM_DEBUG)      := -DDEBUG
++
++obj-y += dynamic_dump_stack.o
+diff -uNr kernel_original/Makefile kernel_p_old/Makefile
+--- kernel_original/Makefile	2017-06-17 10:44:24.000000000 -0700
++++ kernel_p_old/Makefile	2020-05-01 20:47:44.562785837 -0700
+@@ -879,7 +879,7 @@
+ 
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ mm/ fs/ ipc/ security/ crypto/ block/ dump_stack/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, $(init-y) $(init-m) \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
